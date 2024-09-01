@@ -1,0 +1,249 @@
+// ==UserScript==
+// @name         Gitlab-AI-MR
+// @namespace    http://tampermonkey.net/
+// @version      0.1
+// @description  自动总结MR
+// @match        https://xxxxxx/*/merge_requests/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_addStyle
+// @require      https://cdnjs.cloudflare.com/ajax/libs/marked/2.1.3/marked.min.js
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const API = {
+        BASE_URL: '',
+        KEY: '',
+        MODEL: "claude-3-5-sonnet-20240620",
+        PROMPT: "你是是一位资深编程专家，负责代码变更的审查工作。首先请简单总结本次变更，作为 摘要 模块，第二步需要给出 编码建议 根据不同文件，给出审查建议，以精炼的语言、严厉的语气指出存在的问题。建议中的语句可以使用emoji结尾。你的反馈内容必须使用严谨的markdown格式。例如使用标题、表格、引用、代码块、分割线、emoji等，标题推荐从二级开始使用"
+    };
+
+    const state = {
+        contentMap: new Map(),
+        currentModal: null,
+        currentFileName: null
+    };
+
+    function initializeAISummary() {
+        addViewerButtons();
+        fetchChanges()
+            .then(processChatGPTResults)
+            .catch(console.error);
+    }
+
+    function fetchChanges() {
+        const url = getChangesURL();
+        return fetch(url, {headers: {"Accept": "application/json"}})
+            .then(response => response.json())
+            .then(data => data.changes || []);
+    }
+
+    function enhancedChatGPT(change) {
+        const startTime = Date.now();
+
+        // 简单的token计数函数
+        function estimateTokens(text) {
+            // 粗略估计：每4个字符算1个token
+            return Math.ceil(text.length / 4);
+        }
+
+        return chatGPT(change).then(result => {
+            const endTime = Date.now();
+            const duration = (endTime - startTime) / 1000; // 转换为秒
+
+            // 估算输入和输出的token数量
+            const inputTokens = estimateTokens(JSON.stringify(change));
+            const outputTokens = estimateTokens(result);
+
+        const stats = `
+## AI 统计统计
+
+- 耗时：${duration.toFixed(2)} 秒
+- 估算输入 tokens：${inputTokens}
+- 估算输出 tokens：${outputTokens}
+- 估算总 tokens：${inputTokens + outputTokens}
+---
+
+`
+
+            // 将统计信息追加到原始结果后
+            return result + stats;
+        });
+    }
+
+    async function processChatGPTResults(changes) {
+        for (const change of changes) {
+            try {
+                const result = await enhancedChatGPT(change);
+                state.contentMap.set(change.new_path, result);
+                console.log(`Result for change:${change.new_path}`, result);
+                updateCurrentMarkdownViewer();
+            } catch (error) {
+                console.error(`Error processing change:`, error);
+            }
+        }
+    }
+
+    function getChangesURL() {
+        const projectId = document.body.innerHTML.match(/data-project-id="(\d+)"/)?.[1];
+        const mrId = window.location.href.match(/\/merge_requests\/(\d+)/)?.[1];
+        if (!projectId || !mrId) {
+            throw new Error('无法获取project ID或merge request ID');
+        }
+        return `https://gitlab.zhangyue-inc.com/api/v4/projects/${projectId}/merge_requests/${mrId}/changes`;
+    }
+
+    function chatGPT(change) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: "POST",
+                url: `${API.BASE_URL}/chat/completions`,
+                headers: {
+                    "Content-Type": "application/json",
+                    Authorization: `Bearer ${API.KEY}`,
+                },
+                data: JSON.stringify({
+                    model: API.MODEL,
+                    messages: [
+                        {role: "system", content: API.PROMPT},
+                        {role: "user", content: JSON.stringify(change)}
+                    ],
+                    temperature: 0.6,
+                }),
+                onload: response => {
+                    if (response.status === 200) {
+                        resolve(JSON.parse(response.responseText).choices[0].message.content || []);
+                    } else {
+                        reject(new Error(`Request failed with status ${response.status}`));
+                    }
+                },
+                onerror: reject
+            });
+        });
+    }
+
+    function addAISummaryButton() {
+        const targetElement = document.querySelector('.detail-page-header-actions.gl-align-self-start.is-merge-request.js-issuable-actions');
+        if (targetElement) {
+            const button = createButton('AI总结', initializeAISummary);
+            button.className += ' gl-display-none gl-md-display-block btn gl-button btn-default btn-grouped js-issuable-edit';
+            targetElement.insertBefore(button, targetElement.firstChild);
+        }
+    }
+
+    function addViewerButtons() {
+        document.querySelectorAll('.file-actions, .tree-controls').forEach(row => {
+            if (!row.querySelector('.md-viewer-btn')) {
+                const fileName = row.parentNode.children[0].innerText.trim();
+                const button = createButton('查看总结', () => showMarkdownViewer(fileName), 'md-viewer-btn');
+                row.appendChild(button);
+            }
+        });
+    }
+
+    function createButton(text, onClick, className = '') {
+        const button = document.createElement('button');
+        button.textContent = text;
+        button.className = className;
+        button.addEventListener('click', onClick);
+        return button;
+    }
+
+    function showMarkdownViewer(fileName) {
+        state.currentFileName = fileName;
+        const content = state.contentMap.get(fileName) || "等待总结中。。。";
+
+        if (!state.currentModal) {
+            state.currentModal = createModal();
+        }
+
+        updateModalContent(content);
+        state.currentModal.style.display = 'block';
+    }
+
+    function createModal() {
+        const modal = document.createElement('div');
+        modal.className = 'md-viewer-modal';
+        modal.innerHTML = `
+            <div class="md-viewer-content">
+                <span class="md-viewer-close">&times;</span>
+                <h2 style="margin-top: 0;">AI Code Review</h2>
+                <div class="md-content"></div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+
+        modal.querySelector('.md-viewer-close').onclick = () => modal.style.display = 'none';
+        window.onclick = event => {
+            if (event.target === modal) modal.style.display = 'none';
+        };
+
+        return modal;
+    }
+
+    function updateModalContent(content) {
+        if (state.currentModal) {
+            state.currentModal.querySelector('.md-content').innerHTML = marked(content);
+        }
+    }
+
+    function updateCurrentMarkdownViewer() {
+        if (state.currentFileName && state.currentModal) {
+            updateModalContent(state.contentMap.get(state.currentFileName));
+        }
+    }
+
+    window.addEventListener('load', () => setTimeout(addAISummaryButton, 600));
+
+    GM_addStyle(`
+        .md-viewer-btn {
+            background-color: #1f75cb;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: background-color 0.3s;
+            margin-left: 10px;
+        }
+        .md-viewer-btn:hover { background-color: #1c68b3; }
+        .md-viewer-modal {
+            display: none;
+            position: fixed;
+            z-index: 9999;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+        }
+        .md-viewer-content {
+            background-color: #fefefe;
+            margin: 5% auto;
+            padding: 20px;
+            border: 1px solid #888;
+            width: 80%;
+            max-width: 800px;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        .md-viewer-close {
+            color: #aaa;
+            float: right;
+            font-size: 28px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .md-viewer-close:hover { color: #000; }
+        .md-content {
+            margin-top: 20px;
+            max-height: 70vh;
+            overflow-y: auto;
+            padding: 15px;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+        }
+    `);
+})();
